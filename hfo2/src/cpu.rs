@@ -15,7 +15,7 @@
  */
 
 use core::mem::{self, ManuallyDrop};
-use core::ops::Deref;
+use core::ops::{Deref, DerefMut};
 use core::ptr;
 
 use crate::addr::*;
@@ -243,22 +243,25 @@ pub struct VCpuFaultInfo {
     mode: Mode,
 }
 
-pub struct VCpuInner {
-    /// The state is only changed in the context of the vCPU being run. This
-    /// ensures the scheduler can easily keep track of the vCPU state as
-    /// transitions are indicated by the return code from the run call.
-    pub state: VCpuStatus,
-    pub cpu: *const Cpu,
-    pub regs: ArchRegs,
+pub enum VCpuInner {
+    Running {
+        cpu: *const Cpu,
+    },
+    Suspended {
+        /// The state is only changed in the context of the vCPU being run. This
+        /// ensures the scheduler can easily keep track of the vCPU state as
+        /// transitions are indicated by the return code from the run call.
+        state: VCpuStatus,
+        regs: ArchRegs,
+    }
 }
 
 impl VCpuInner {
     pub fn new() -> Self {
         // TODO(HfO2): `ArchRegs::default()` may allocate large memory in stack, incurring stack
         // overflow.
-        Self {
+        Self::Suspended {
             state: VCpuStatus::Off,
-            cpu: ptr::null(),
             regs: ArchRegs::default(),
         }
     }
@@ -267,8 +270,14 @@ impl VCpuInner {
     /// VCpuStatus::Ready. The caller must hold the vCPU execution lock while
     /// calling this.
     pub fn on(&mut self, entry: ipaddr_t, arg: uintreg_t) {
-        self.regs.set_pc_arg(entry, arg);
-        self.state = VCpuStatus::Ready;
+        match self {
+            Self::Running { .. } => panic!("Trying to turn on already running vCPU."),
+            Self::Suspended { state, regs } => {
+                regs.set_pc_arg(entry, arg);
+                *state = VCpuStatus::Ready;
+            }
+        }
+        
     }
 
     /// Check whether self is an off state, for the purpose of turning vCPUs on
@@ -277,7 +286,10 @@ impl VCpuInner {
         // Aborted still counts as ON for the purposes of PSCI, because according to the PSCI
         // specification (section 5.7.1) a core is only considered to be off if it has been turned
         // off with a CPU_OFF call or hasn't yet been turned on with a CPU_ON call.
-        self.state == VCpuStatus::Off
+        match self {
+            Self::Running { .. } => false,
+            Self::Suspended { state, .. } => *state == VCpuStatus::Off
+        }
     }
 }
 
@@ -512,13 +524,19 @@ pub unsafe extern "C" fn vcpu_index(vcpu: *const VCpu) -> spci_vcpu_index_t {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn vcpu_get_regs(vcpu: *mut VCpu) -> *mut ArchRegs {
-    &mut (*vcpu).inner.get_mut_unchecked().regs
+pub unsafe extern "C" fn vcpu_get_regs(vcpu: *const VCpu) -> *mut ArchRegs {
+    match (*vcpu).inner.get_mut_unchecked() {
+        VCpuInner::Running { .. } => panic!("Trying to get registers of running vCPU."),
+        VCpuInner::Suspended { state, regs } => regs
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn vcpu_get_regs_const(vcpu: *const VCpu) -> *const ArchRegs {
-    &(*vcpu).inner.get_unchecked().regs
+    match (*vcpu).inner.get_unchecked() {
+        VCpuInner::Running { .. } => panic!("Trying to get registers of running vCPU."),
+        VCpuInner::Suspended { state, regs } => regs
+    }
 }
 
 #[no_mangle]
@@ -528,7 +546,10 @@ pub unsafe extern "C" fn vcpu_get_vm(vcpu: *const VCpu) -> *const Vm {
 
 #[no_mangle]
 pub unsafe extern "C" fn vcpu_get_cpu(vcpu: *const VCpu) -> *const Cpu {
-    (*vcpu).inner.get_mut_unchecked().cpu
+    match (*vcpu).inner.get_unchecked() {
+        VCpuInner::Running { cpu } => *cpu,
+        VCpuInner::Suspended { .. } => panic!("Trying to get CPU of suspended vCPU."),
+    }
 }
 
 #[no_mangle]
@@ -572,7 +593,10 @@ pub unsafe extern "C" fn vcpu_secondary_reset_and_start(
         // is a secondary which can migrate between pCPUs, the ID of the
         // vCPU is defined as the index and does not match the ID of the
         // pCPU it is running on.
-        state.regs.reset(false, vm, cpu_id_t::from(vcpu.index()));
+        match state.deref_mut() {
+            VCpuInner::Running { .. } => unreachable!(),
+            VCpuInner::Suspended { state, regs } => regs.reset(false, vm, cpu_id_t::from(vcpu.index())),
+        };
         state.on(entry, arg);
     }
 
