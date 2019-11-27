@@ -18,6 +18,7 @@ use core::mem;
 use core::ops::*;
 use core::slice;
 
+use crate::mpool::*;
 use crate::utils::*;
 
 pub const PAGE_BITS: usize = 12;
@@ -73,6 +74,17 @@ impl Page {
         let ptr = self.ptr;
         mem::forget(self);
         ptr
+    }
+
+    pub fn new_from(value: RawPage, mpool: &MPool) -> Result<Self, RawPage> {
+        if let Ok(page) = mpool.alloc() {
+            unsafe {
+                page.ptr.write(value);
+            }
+            Ok(page)
+        } else {
+            Err(value)
+        }
     }
 }
 

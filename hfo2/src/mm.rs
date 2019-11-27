@@ -25,6 +25,7 @@
 //! We assume that the stage 1 and stage 2 page table addresses are `usize`.  It looks like that
 //! assumption might not be holding so we need to check that everything is going to be okay.
 
+use arr_macro::arr;
 use core::cmp;
 use core::marker::PhantomData;
 use core::mem;
@@ -436,36 +437,17 @@ impl PageTableEntry {
             return Ok(());
         }
 
-        // Allocate a new table.
-        let mut page = mpool
-            .alloc()
-            .map_err(|_| dlog!("Failed to allocate memory for page table\n"))?;
-
-        let table = unsafe { RawPageTable::deref_mut_page(&mut page) };
-
         // Initialise entries in the new table.
         let level_below = level - 1;
-        if self.is_block(level) {
-            let attrs = self.attrs(level);
-            let entry_size = addr::entry_size(level_below);
-
-            for (i, pte) in table.iter_mut().enumerate() {
-                unsafe {
-                    ptr::write(
-                        pte,
-                        Self::block(
-                            level_below,
-                            pa_init(self.inner as usize + i * entry_size),
-                            attrs,
-                        ),
-                    );
-                }
-            }
+        let page_inner = if self.is_block(level) {
+            RawPageTable::block(level_below, self.inner as usize, self.attrs(level))
         } else {
-            for pte in table.iter_mut() {
-                unsafe { ptr::write(pte, Self::absent(level_below)) };
-            }
-        }
+            RawPageTable::empty(level_below)
+        };
+
+        // Allocate a new table.
+        let page = Page::new_from(page_inner.into(), mpool)
+            .map_err(|_| dlog!("Failed to allocate memory for page table\n"))?;
 
         // Ensure initialisation is visible before updating the pte.
         //
@@ -590,6 +572,12 @@ impl DerefMut for RawPageTable {
     }
 }
 
+impl Into<RawPage> for RawPageTable {
+    fn into(self) -> RawPage {
+        unsafe { mem::transmute(self) }
+    }
+}
+
 impl RawPageTable {
     unsafe fn deref_page(page: &Page) -> &Self {
         Self::deref_raw_page(page)
@@ -610,6 +598,21 @@ impl RawPageTable {
     /// Returns whether all entries in this table are absent.
     fn is_empty(&self, level: u8) -> bool {
         self.iter().all(|pte| !pte.is_present(level))
+    }
+
+    fn empty(level: u8) -> Self {
+        Self {
+            entries: arr![PageTableEntry::absent(level); 512],
+        }
+    }
+
+    fn block(level: u8, begin: usize, attrs: u64) -> Self {
+        let entry_size = addr::entry_size(level);
+        let mut i = 0;
+
+        Self {
+            entries: arr![PageTableEntry::block(level, pa_init(begin + {i += 1; i - 1} * entry_size), attrs); 512],
+        }
     }
 
     /// Updates the page table at the given level to map the given address range to a physical range
