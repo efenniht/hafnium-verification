@@ -302,10 +302,26 @@ impl PageTableEntry {
         Self { inner }
     }
 
+    #[cfg(target_arch = "aarch64")]
+    fn absent(level: u8) -> Self {
+        unsafe { Self::from_raw(0) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
     fn absent(level: u8) -> Self {
         unsafe { Self::from_raw(arch_mm_absent_pte(level)) }
     }
 
+    #[cfg(target_arch = "aarch64")]
+    fn block(level: u8, begin: paddr_t, attrs: u64) -> Self {
+        let mut pte = pa_addr(begin) as u64 | attrs;
+        if level == 0 {
+            pte |= 1u64 << 1; // PTE_LEVEL0_BLOCK
+        }
+        unsafe { Self::from_raw(pte) }
+    }
+
+    #[cfg(target_arch = "x86_64")]
     fn block(level: u8, begin: paddr_t, attrs: u64) -> Self {
         unsafe { Self::from_raw(arch_mm_block_pte(level, begin, attrs)) }
     }
@@ -439,14 +455,15 @@ impl PageTableEntry {
 
         // Initialise entries in the new table.
         let level_below = level - 1;
-        let page_inner = if self.is_block(level) {
+        let inner = if self.is_block(level) {
             RawPageTable::block(level_below, self.inner as usize, self.attrs(level))
         } else {
             RawPageTable::empty(level_below)
-        };
+        }
+        .into();
 
         // Allocate a new table.
-        let page = Page::new_from(page_inner.into(), mpool)
+        let page = Page::new_from(inner, mpool)
             .map_err(|_| dlog!("Failed to allocate memory for page table\n"))?;
 
         // Ensure initialisation is visible before updating the pte.
@@ -600,12 +617,14 @@ impl RawPageTable {
         self.iter().all(|pte| !pte.is_present(level))
     }
 
+    #[inline(always)]
     fn empty(level: u8) -> Self {
         Self {
             entries: arr![PageTableEntry::absent(level); 512],
         }
     }
 
+    #[inline(always)]
     fn block(level: u8, begin: usize, attrs: u64) -> Self {
         let entry_size = addr::entry_size(level);
         let mut i = 0;

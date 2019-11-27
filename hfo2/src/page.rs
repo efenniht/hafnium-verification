@@ -76,6 +76,7 @@ impl Page {
         ptr
     }
 
+    #[inline(always)]
     pub fn new_from(value: RawPage, mpool: &MPool) -> Result<Self, RawPage> {
         if let Ok(page) = mpool.alloc() {
             unsafe {
